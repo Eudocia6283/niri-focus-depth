@@ -1,0 +1,12 @@
+# Local upstream checkout & build artifacts
+niri/
+
+# Arch makepkg build outputs
+src/
+pkg/
+*.pkg.tar.*
+
+# Misc temporary / editor files
+*.log
+.DS_Store
+*~

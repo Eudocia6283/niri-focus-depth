@@ -1,0 +1,1961 @@
+diff --git a/niri-config/src/layout.rs b/niri-config/src/layout.rs
+index f84528b..d06977c 100644
+--- a/niri-config/src/layout.rs
++++ b/niri-config/src/layout.rs
+@@ -24,6 +24,67 @@ pub struct Layout {
+     pub gaps: f64,
+     pub struts: Struts,
+     pub background_color: Color,
++    pub focus_depth: FocusDepth,
++}
++
++/// Visual depth effect for unfocused windows (scale down, fade, blur, stack tighter).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct FocusDepth {
++    pub off: bool,
++    pub inactive_scale: f64,
++    pub inactive_opacity: f64,
++    pub inactive_blur: f64,
++    pub stack_overlap: f64,
++}
++
++impl Default for FocusDepth {
++    fn default() -> Self {
++        Self {
++            off: true,
++            inactive_scale: 0.92,
++            inactive_opacity: 0.78,
++            inactive_blur: 2.0,
++            stack_overlap: 48.,
++        }
++    }
++}
++
++impl MergeWith<FocusDepthPart> for FocusDepth {
++    fn merge_with(&mut self, part: &FocusDepthPart) {
++        self.off |= part.off;
++        if part.on {
++            self.off = false;
++        }
++
++        if let Some(scale) = part.inactive_scale {
++            self.inactive_scale = scale.0.clamp(0.5, 1.0);
++        }
++        if let Some(opacity) = part.inactive_opacity {
++            self.inactive_opacity = opacity.0.clamp(0.05, 1.0);
++        }
++        if let Some(blur) = part.inactive_blur {
++            self.inactive_blur = blur.0.clamp(0.0, 10.0);
++        }
++        if let Some(overlap) = part.stack_overlap {
++            self.stack_overlap = overlap.0.max(0.0);
++        }
++    }
++}
++
++#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
++pub struct FocusDepthPart {
++    #[knuffel(child)]
++    pub off: bool,
++    #[knuffel(child)]
++    pub on: bool,
++    #[knuffel(child, unwrap(argument))]
++    pub inactive_scale: Option<FloatOrInt<0, 1>>,
++    #[knuffel(child, unwrap(argument))]
++    pub inactive_opacity: Option<FloatOrInt<0, 1>>,
++    #[knuffel(child, unwrap(argument))]
++    pub inactive_blur: Option<FloatOrInt<0, 10>>,
++    #[knuffel(child, unwrap(argument))]
++    pub stack_overlap: Option<FloatOrInt<0, 4096>>,
+ }
+ 
+ impl Default for Layout {
+@@ -52,6 +113,7 @@ impl Default for Layout {
+                 PresetSize::Proportion(2. / 3.),
+             ],
+             background_color: DEFAULT_BACKGROUND_COLOR,
++            focus_depth: FocusDepth::default(),
+         }
+     }
+ }
+@@ -68,6 +130,7 @@ impl MergeWith<LayoutPart> for Layout {
+             always_center_single_column,
+             empty_workspace_above_first,
+             gaps,
++            focus_depth,
+         );
+ 
+         merge_clone!(
+@@ -126,6 +189,8 @@ pub struct LayoutPart {
+     pub struts: Option<Struts>,
+     #[knuffel(child)]
+     pub background_color: Option<Color>,
++    #[knuffel(child)]
++    pub focus_depth: Option<FocusDepthPart>,
+ }
+ 
+ #[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+diff --git a/niri-config/src/lib.rs b/niri-config/src/lib.rs
+index 329b766..62a8b9f 100644
+--- a/niri-config/src/lib.rs
++++ b/niri-config/src/lib.rs
+@@ -1471,6 +1471,13 @@ mod tests {
+                     b: 0.25,
+                     a: 1.0,
+                 },
++                focus_depth: FocusDepth {
++                    off: true,
++                    inactive_scale: 0.92,
++                    inactive_opacity: 0.78,
++                    inactive_blur: 2.0,
++                    stack_overlap: 48.0,
++                },
+             },
+             prefer_no_csd: true,
+             cursor: Cursor {
+@@ -2387,6 +2394,74 @@ mod tests {
+         "#);
+     }
+ 
++    #[test]
++    fn parse_focus_depth() {
++        // Default: off.
++        let config = Config::parse_mem("").unwrap();
++        assert!(config.layout.focus_depth.off);
++
++        let config = Config::parse_mem(
++            r#"
++            layout {
++                focus-depth {
++                    on
++                    inactive-scale 0.9
++                    inactive-opacity 0.75
++                    inactive-blur 2.5
++                    stack-overlap 56
++                }
++            }
++
++            output "HDMI-A-1" {
++                layout {
++                    focus-depth {
++                        off
++                    }
++                }
++            }
++
++            workspace "chat" {
++                layout {
++                    focus-depth {
++                        inactive-scale 0.95
++                    }
++                }
++            }
++            "#,
++        )
++        .unwrap();
++
++        let fd = config.layout.focus_depth;
++        assert!(!fd.off);
++        assert_eq!(fd.inactive_scale, 0.9);
++        assert_eq!(fd.inactive_opacity, 0.75);
++        assert_eq!(fd.inactive_blur, 2.5);
++        assert_eq!(fd.stack_overlap, 56.);
++
++        // Per-output override disables it.
++        let output = &config.outputs.0[0];
++        let part = output.layout.as_ref().unwrap();
++        let mut merged = config.layout.clone();
++        merged.merge_with(part);
++        assert!(merged.focus_depth.off);
++        assert_eq!(merged.focus_depth.inactive_scale, 0.9);
++        assert_eq!(merged.focus_depth.inactive_blur, 2.5);
++
++        // Per-workspace override changes only the scale.
++        let ws = &config.workspaces[0];
++        let part = &ws.layout.as_ref().unwrap().0;
++        let mut merged = config.layout.clone();
++        merged.merge_with(part);
++        assert!(!merged.focus_depth.off);
++        assert_eq!(merged.focus_depth.inactive_scale, 0.95);
++        assert_eq!(merged.focus_depth.inactive_opacity, 0.75);
++        assert_eq!(merged.focus_depth.inactive_blur, 2.5);
++
++        // Out-of-range values are rejected by the parser.
++        assert!(Config::parse_mem("layout { focus-depth { inactive-scale 2.0; } }").is_err());
++        assert!(Config::parse_mem("layout { focus-depth { inactive-blur 20; } }").is_err());
++    }
++
+     fn diff_lines(expected: &str, actual: &str) -> String {
+         let mut output = String::new();
+         let mut in_change = false;
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 5c4dd63..ebf4fba 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -70,7 +70,7 @@ use crate::render_helpers::{BakedBuffer, RenderCtx};
+ use crate::rubber_band::RubberBand;
+ use crate::utils::transaction::{Transaction, TransactionBlocker};
+ use crate::utils::{
+-    ensure_min_max_size_maybe_zero, output_matches_name, output_size,
++    ensure_min_max_size_maybe_zero, output_matches_name, output_size, round_logical_in_physical,
+     round_logical_in_physical_max1, ResizeEdge,
+ };
+ use crate::window::ResolvedWindowRules;
+@@ -632,8 +632,18 @@ impl HitType {
+         point: Point<f64, Logical>,
+     ) -> Option<(&W, Self)> {
+         let pos_within_tile = point - tile_pos;
+-        tile.hit(pos_within_tile)
+-            .map(|hit| (tile.window(), hit.offset_win_pos(tile_pos)))
++        // Undo the focus-depth visual scale (around the tile center), so that hits match what
++        // is drawn on screen.
++        let scale = tile.focus_depth_scale();
++        let unscaled_pos = if (scale - 1.).abs() > 1e-4 {
++            let center = tile.animated_tile_size().to_point().downscale(2.);
++            (pos_within_tile - center).downscale(scale) + center
++        } else {
++            pos_within_tile
++        };
++        let delta = pos_within_tile - unscaled_pos;
++        tile.hit(unscaled_pos)
++            .map(|hit| (tile.window(), hit.offset_win_pos(tile_pos + delta)))
+     }
+ 
+     pub fn to_activate(self) -> Self {
+@@ -669,6 +679,8 @@ impl Options {
+ 
+     fn adjusted_for_scale(mut self, scale: f64) -> Self {
+         self.layout.gaps = round_logical_in_physical_max1(scale, self.layout.gaps);
++        self.layout.focus_depth.stack_overlap =
++            round_logical_in_physical(scale, self.layout.focus_depth.stack_overlap);
+         self
+     }
+ }
+diff --git a/src/layout/monitor.rs b/src/layout/monitor.rs
+index 53c0606..b3c367c 100644
+--- a/src/layout/monitor.rs
++++ b/src/layout/monitor.rs
+@@ -1096,7 +1096,13 @@ impl<W: LayoutElement> Monitor<W> {
+             .as_ref()
+             .and_then(|hint| hint.workspace.existing_id());
+ 
++        let overview_progress = self
++            .overview_progress
++            .as_ref()
++            .map_or(0., |p| p.value().clamp(0., 1.));
++
+         for (ws, geo) in self.workspaces_with_render_geo_mut(true) {
++            ws.set_overview_progress(overview_progress);
+             ws.update_render_elements(is_active);
+ 
+             if Some(ws.id()) == insert_hint_ws_id {
+diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
+index 007bcaf..fa136c0 100644
+--- a/src/layout/scrolling.rs
++++ b/src/layout/scrolling.rs
+@@ -24,7 +24,7 @@ use crate::render_helpers::renderer::NiriRenderer;
+ use crate::render_helpers::xray::XrayPos;
+ use crate::render_helpers::RenderCtx;
+ use crate::utils::transaction::{Transaction, TransactionBlocker};
+-use crate::utils::ResizeEdge;
++use crate::utils::{round_logical_in_physical, ResizeEdge};
+ use crate::window::ResolvedWindowRules;
+ 
+ /// Amount of touchpad movement to scroll the view for the width of one working area.
+@@ -92,6 +92,12 @@ pub struct ScrollingSpace<W: LayoutElement> {
+ 
+     /// Configurable properties of the layout.
+     options: Rc<Options>,
++
++    /// Whether this scrolling space is currently the active space on its workspace.
++    is_active_space: bool,
++
++    /// Overview open progress [0..=1], used to relax focus-depth in overview.
++    overview_progress: f64,
+ }
+ 
+ niri_render_elements! {
+@@ -195,6 +201,9 @@ pub struct Column<W: LayoutElement> {
+     /// Animation of the render offset during window swapping.
+     move_animation: Option<MoveAnimation>,
+ 
++    /// Visual horizontal tuck offset for focus-depth stacking.
++    focus_depth_x: FocusDepthOffset,
++
+     /// Latest known view size for this column's workspace.
+     view_size: Size<f64, Logical>,
+ 
+@@ -282,6 +291,33 @@ struct MoveAnimation {
+     from: f64,
+ }
+ 
++#[derive(Debug, Default)]
++struct FocusDepthOffset {
++    initialized: bool,
++    target: f64,
++    anim: Option<Animation>,
++    factor: f64,
++}
++
++impl FocusDepthOffset {
++    fn raw_current(&self) -> f64 {
++        if let Some(anim) = &self.anim {
++            anim.value()
++        } else {
++            self.target
++        }
++    }
++
++    fn visual_x(&self, scale: f64) -> f64 {
++        let x = self.raw_current() * self.factor;
++        if x.abs() <= 1e-4 {
++            0.
++        } else {
++            round_logical_in_physical(scale, x)
++        }
++    }
++}
++
+ impl<W: LayoutElement> ScrollingSpace<W> {
+     pub fn new(
+         view_size: Size<f64, Logical>,
+@@ -307,6 +343,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             scale,
+             clock,
+             options,
++            is_active_space: true,
++            overview_progress: 0.,
+         }
+     }
+ 
+@@ -334,6 +372,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         if !self.columns.is_empty() && !self.view_offset.is_gesture() {
+             self.animate_view_offset_to_column(None, self.active_column_idx, None);
+         }
++
++        self.sync_focus_depth();
+     }
+ 
+     pub fn update_shaders(&mut self) {
+@@ -396,13 +436,124 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             || !self.closing_windows.is_empty()
+     }
+ 
++    pub fn set_overview_progress(&mut self, overview_progress: f64) {
++        self.overview_progress = overview_progress.clamp(0., 1.);
++    }
++
++    fn compute_target_focus_depth_offsets(&self) -> Vec<f64> {
++        let n = self.columns.len();
++        let mut targets = vec![0.; n];
++        if n <= 1 || self.options.layout.focus_depth.off {
++            return targets;
++        }
++
++        let active = self.active_column_idx.min(n - 1);
++        if !self.columns[active].sizing_mode().is_normal() {
++            return targets;
++        }
++
++        let s = self.options.layout.focus_depth.inactive_scale.clamp(0.5, 1.0);
++        let overlap = self.options.layout.focus_depth.stack_overlap.max(0.0);
++
++        // Walk left of active column: shift rightward (+cum_pull) to tuck behind active column.
++        let mut cum_pull = 0.;
++        for i in (0..active).rev() {
++            if !self.columns[i].sizing_mode().is_normal() {
++                targets[i] = cum_pull;
++                continue;
++            }
++            let prev = i + 1;
++            let w_prev = self.data[prev].width;
++            let w_curr = self.data[i].width;
++            let s_prev = if prev == active { 1.0 } else { s };
++            let s_curr = s;
++            let scale_comp = (w_prev * (1.0 - s_prev) + w_curr * (1.0 - s_curr)) * 0.5;
++            let max_overlap = (w_curr * s_curr * 0.45).max(0.0);
++            let step_overlap = overlap.min(max_overlap);
++            cum_pull += scale_comp + step_overlap;
++            targets[i] = cum_pull;
++        }
++
++        // Walk right of active column: shift leftward (-cum_pull) to tuck behind active column.
++        let mut cum_pull = 0.;
++        for i in (active + 1)..n {
++            if !self.columns[i].sizing_mode().is_normal() {
++                targets[i] = -cum_pull;
++                continue;
++            }
++            let prev = i - 1;
++            let w_prev = self.data[prev].width;
++            let w_curr = self.data[i].width;
++            let s_prev = if prev == active { 1.0 } else { s };
++            let s_curr = s;
++            let scale_comp = (w_prev * (1.0 - s_prev) + w_curr * (1.0 - s_curr)) * 0.5;
++            let max_overlap = (w_curr * s_curr * 0.45).max(0.0);
++            let step_overlap = overlap.min(max_overlap);
++            cum_pull += scale_comp + step_overlap;
++            targets[i] = -cum_pull;
++        }
++
++        targets
++    }
++
++    pub fn sync_focus_depth(&mut self) {
++        if self.columns.is_empty() {
++            return;
++        }
++
++        let targets = self.compute_target_focus_depth_offsets();
++        let active_col_idx = self.active_column_idx;
++        let active_expanded = self.columns[active_col_idx].expanded_progress();
++        let overview_progress = self.overview_progress;
++        let is_active_space = self.is_active_space;
++        let anim_config = self.options.animations.horizontal_view_movement.0;
++
++        for (col_idx, (col, target)) in zip(&mut self.columns, targets).enumerate() {
++            let col_is_active = is_active_space && col_idx == active_col_idx;
++            let col_expanded = col.expanded_progress();
++            col.focus_depth_x.factor =
++                (1. - active_expanded) * (1. - col_expanded) * (1. - overview_progress);
++
++            if !col.focus_depth_x.initialized {
++                col.focus_depth_x.initialized = true;
++                col.focus_depth_x.target = target;
++                col.focus_depth_x.anim = None;
++            } else if (col.focus_depth_x.target - target).abs() > 1e-4 {
++                let current = col.focus_depth_x.raw_current();
++                col.focus_depth_x.target = target;
++                if (current - target).abs() <= 1e-4 {
++                    col.focus_depth_x.anim = None;
++                } else {
++                    col.focus_depth_x.anim = Some(Animation::new(
++                        col.clock.clone(),
++                        current,
++                        target,
++                        0.,
++                        anim_config,
++                    ));
++                }
++            }
++
++            let active_tile_idx = col.active_tile_idx;
++            for (tile_idx, tile) in col.tiles.iter_mut().enumerate() {
++                let tile_is_active = col_is_active && tile_idx == active_tile_idx;
++                tile.sync_focus_depth(tile_is_active, overview_progress);
++            }
++        }
++    }
++
+     pub fn update_render_elements(&mut self, is_active: bool) {
++        self.is_active_space = is_active;
++        self.sync_focus_depth();
++
++        let scale = self.scale;
+         let view_pos = Point::from((self.view_pos(), 0.));
+         let view_size = self.view_size;
+         let active_idx = self.active_column_idx;
+         for (col_idx, (col, col_x)) in self.columns_mut().enumerate() {
+             let is_active = is_active && col_idx == active_idx;
+-            let col_off = Point::from((col_x, 0.));
++            let depth_x = col.focus_depth_x.visual_x(scale);
++            let col_off = Point::from((col_x + depth_x, 0.));
+             let col_pos = view_pos - col_off - col.render_offset();
+             let view_rect = Rectangle::new(col_pos, view_size);
+             col.update_render_elements(is_active, view_rect);
+@@ -796,6 +947,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             self.view_offset_to_restore = None;
+             self.interactive_resize = None;
+         }
++
++        self.sync_focus_depth();
+     }
+ 
+     pub(super) fn insert_position(&self, pos: Point<f64, Logical>) -> InsertPosition {
+@@ -940,6 +1093,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 col.animate_move_from(offset);
+             }
+         }
++
++        self.sync_focus_depth();
+     }
+ 
+     pub fn add_tile_right_of(
+@@ -1020,6 +1175,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 anim_config.unwrap_or(self.options.animations.horizontal_view_movement.0);
+             self.activate_column_with_anim_config(idx, anim_config);
+             self.activate_prev_column_on_removal = prev_offset;
++        } else {
++            self.sync_focus_depth();
+         }
+     }
+ 
+@@ -1148,6 +1305,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             }
+         }
+ 
++        self.sync_focus_depth();
++
+         tile
+     }
+ 
+@@ -1242,6 +1401,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             );
+         }
+ 
++        self.sync_focus_depth();
++
+         column
+     }
+ 
+@@ -1405,6 +1566,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 self.animate_view_offset_to_column_with_config(None, col_idx, None, config);
+             }
+         }
++
++        self.sync_focus_depth();
+     }
+ 
+     pub fn scroll_amount_to_activate(&self, window: &W::Id) -> f64 {
+@@ -1441,6 +1604,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+ 
+         column.activate_window(window);
+         self.activate_column(column_idx);
++        self.sync_focus_depth();
+ 
+         true
+     }
+@@ -1591,6 +1755,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+ 
+         self.columns[self.active_column_idx].focus_index(index);
++        self.sync_focus_depth();
+     }
+ 
+     pub fn focus_down(&mut self) -> bool {
+@@ -1598,7 +1763,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             return false;
+         }
+ 
+-        self.columns[self.active_column_idx].focus_down()
++        let rv = self.columns[self.active_column_idx].focus_down();
++        if rv {
++            self.sync_focus_depth();
++        }
++        rv
+     }
+ 
+     pub fn focus_up(&mut self) -> bool {
+@@ -1606,7 +1775,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             return false;
+         }
+ 
+-        self.columns[self.active_column_idx].focus_up()
++        let rv = self.columns[self.active_column_idx].focus_up();
++        if rv {
++            self.sync_focus_depth();
++        }
++        rv
+     }
+ 
+     pub fn focus_down_or_left(&mut self) {
+@@ -1615,7 +1788,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+ 
+         let column = &mut self.columns[self.active_column_idx];
+-        if !column.focus_down() {
++        if column.focus_down() {
++            self.sync_focus_depth();
++        } else {
+             self.focus_left();
+         }
+     }
+@@ -1626,7 +1801,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+ 
+         let column = &mut self.columns[self.active_column_idx];
+-        if !column.focus_down() {
++        if column.focus_down() {
++            self.sync_focus_depth();
++        } else {
+             self.focus_right();
+         }
+     }
+@@ -1637,7 +1814,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+ 
+         let column = &mut self.columns[self.active_column_idx];
+-        if !column.focus_up() {
++        if column.focus_up() {
++            self.sync_focus_depth();
++        } else {
+             self.focus_left();
+         }
+     }
+@@ -1648,7 +1827,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+ 
+         let column = &mut self.columns[self.active_column_idx];
+-        if !column.focus_up() {
++        if column.focus_up() {
++            self.sync_focus_depth();
++        } else {
+             self.focus_right();
+         }
+     }
+@@ -1658,7 +1839,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             return;
+         }
+ 
+-        self.columns[self.active_column_idx].focus_top()
++        self.columns[self.active_column_idx].focus_top();
++        self.sync_focus_depth();
+     }
+ 
+     pub fn focus_bottom(&mut self) {
+@@ -1666,7 +1848,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             return;
+         }
+ 
+-        self.columns[self.active_column_idx].focus_bottom()
++        self.columns[self.active_column_idx].focus_bottom();
++        self.sync_focus_depth();
+     }
+ 
+     pub fn move_column_to_index(&mut self, index: usize) {
+@@ -2322,17 +2505,29 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+             .unwrap()
+     }
+ 
+-    fn column_xs_in_render_order(
+-        &self,
+-        data: impl Iterator<Item = ColumnData>,
+-    ) -> impl Iterator<Item = f64> {
+-        let active_idx = self.active_column_idx;
+-        let active_pos = self.column_x(active_idx);
+-        let offsets = self
+-            .column_xs(data)
+-            .enumerate()
+-            .filter_map(move |(idx, pos)| (idx != active_idx).then_some(pos));
+-        iter::once(active_pos).chain(offsets)
++    fn visual_column_xs_in_render_order(&self) -> Vec<f64> {
++        if self.columns.is_empty() {
++            return Vec::new();
++        }
++
++        let scale = self.scale;
++        let xs: Vec<f64> = zip(&self.columns, self.column_xs(self.data.iter().copied()))
++            .map(|(col, x)| x + col.focus_depth_x.visual_x(scale))
++            .collect();
++
++        let (first, rest) = xs.split_at(self.active_column_idx);
++        let (active, rest) = rest.split_at(1);
++
++        let mut out = Vec::with_capacity(xs.len());
++        out.extend_from_slice(active);
++        if self.options.layout.focus_depth.off {
++            out.extend_from_slice(first);
++        } else {
++            // Render nearest left columns first so cascading card overlap stays properly layered.
++            out.extend(first.iter().rev().copied());
++        }
++        out.extend_from_slice(rest);
++        out
+     }
+ 
+     pub fn columns(&self) -> impl Iterator<Item = &Column<W>> {
+@@ -2345,32 +2540,42 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+     }
+ 
+     fn columns_in_render_order(&self) -> impl Iterator<Item = (&Column<W>, f64)> + '_ {
+-        let offsets = self.column_xs_in_render_order(self.data.iter().copied());
++        let offsets = self.visual_column_xs_in_render_order();
+ 
+-        let (first, active, rest) = if self.columns.is_empty() {
+-            (&[][..], &[][..], &[][..])
+-        } else {
++        let mut columns = Vec::with_capacity(self.columns.len());
++        if !self.columns.is_empty() {
+             let (first, rest) = self.columns.split_at(self.active_column_idx);
+             let (active, rest) = rest.split_at(1);
+-            (first, active, rest)
+-        };
++            columns.extend(active.iter());
++            if self.options.layout.focus_depth.off {
++                columns.extend(first.iter());
++            } else {
++                columns.extend(first.iter().rev());
++            }
++            columns.extend(rest.iter());
++        }
+ 
+-        let columns = active.iter().chain(first).chain(rest);
+         zip(columns, offsets)
+     }
+ 
+     fn columns_in_render_order_mut(&mut self) -> impl Iterator<Item = (&mut Column<W>, f64)> + '_ {
+-        let offsets = self.column_xs_in_render_order(self.data.iter().copied());
++        let offsets = self.visual_column_xs_in_render_order();
++        let active_idx = self.active_column_idx;
++        let reverse_first = !self.options.layout.focus_depth.off;
+ 
+-        let (first, active, rest) = if self.columns.is_empty() {
+-            (&mut [][..], &mut [][..], &mut [][..])
+-        } else {
+-            let (first, rest) = self.columns.split_at_mut(self.active_column_idx);
++        let mut columns = Vec::with_capacity(self.columns.len());
++        if !self.columns.is_empty() {
++            let (first, rest) = self.columns.split_at_mut(active_idx);
+             let (active, rest) = rest.split_at_mut(1);
+-            (first, active, rest)
+-        };
++            columns.extend(active.iter_mut());
++            if reverse_first {
++                columns.extend(first.iter_mut().rev());
++            } else {
++                columns.extend(first.iter_mut());
++            }
++            columns.extend(rest.iter_mut());
++        }
+ 
+-        let columns = active.iter_mut().chain(first).chain(rest);
+         zip(columns, offsets)
+     }
+ 
+@@ -3482,6 +3687,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+ 
+         // HACK: deal with things like snapping to the right edge of a larger-than-view window.
+         self.animate_view_offset_to_column(None, new_col_idx, None);
++        self.sync_focus_depth();
+ 
+         true
+     }
+@@ -3711,6 +3917,8 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 win.refresh();
+             }
+         }
++
++        self.sync_focus_depth();
+     }
+ 
+     #[cfg(test)]
+@@ -3971,6 +4179,7 @@ impl<W: LayoutElement> Column<W> {
+             display_mode,
+             tab_indicator: TabIndicator::new(options.layout.tab_indicator),
+             move_animation: None,
++            focus_depth_x: FocusDepthOffset::default(),
+             view_size,
+             working_area,
+             parent_area,
+@@ -4078,6 +4287,12 @@ impl<W: LayoutElement> Column<W> {
+             }
+         }
+ 
++        if let Some(anim) = &self.focus_depth_x.anim {
++            if anim.is_done() {
++                self.focus_depth_x.anim = None;
++            }
++        }
++
+         for tile in &mut self.tiles {
+             tile.advance_animations();
+         }
+@@ -4087,16 +4302,24 @@ impl<W: LayoutElement> Column<W> {
+ 
+     pub fn are_animations_ongoing(&self) -> bool {
+         self.move_animation.is_some()
++            || self.focus_depth_x.anim.is_some()
+             || self.tab_indicator.are_animations_ongoing()
+             || self.tiles.iter().any(Tile::are_animations_ongoing)
+     }
+ 
+     pub fn are_transitions_ongoing(&self) -> bool {
+         self.move_animation.is_some()
++            || self.focus_depth_x.anim.as_ref().is_some_and(|anim| !anim.is_done())
+             || self.tab_indicator.are_animations_ongoing()
+             || self.tiles.iter().any(Tile::are_transitions_ongoing)
+     }
+ 
++    fn expanded_progress(&self) -> f64 {
++        self.tiles
++            .get(self.active_tile_idx)
++            .map_or(0., Tile::expanded_progress)
++    }
++
+     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
+         let active_idx = self.active_tile_idx;
+         for (tile_idx, (tile, tile_off)) in self.tiles_mut().enumerate() {
+diff --git a/src/layout/shadow.rs b/src/layout/shadow.rs
+index 509ad72..ae78c22 100644
+--- a/src/layout/shadow.rs
++++ b/src/layout/shadow.rs
+@@ -26,6 +26,10 @@ impl Shadow {
+         self.config = config;
+     }
+ 
++    pub fn is_off(&self) -> bool {
++        !self.config.on
++    }
++
+     pub fn update_shaders(&mut self) {
+         for elem in &mut self.shaders {
+             elem.damage_all();
+diff --git a/src/layout/tests/animations.rs b/src/layout/tests/animations.rs
+index 85df548..626fd1c 100644
+--- a/src/layout/tests/animations.rs
++++ b/src/layout/tests/animations.rs
+@@ -1097,3 +1097,199 @@ fn width_resize_and_cancel_of_column_to_the_left() {
+     200 × 200 at x:100 y:  0
+     ");
+ }
++
++#[test]
++fn focus_depth_scale_opacity_and_stacking() {
++    use approx::assert_abs_diff_eq;
++
++    const LINEAR: Kind = Kind::Easing(EasingParams {
++        duration_ms: 1000,
++        curve: Curve::Linear,
++    });
++
++    let mut options = Options {
++        layout: niri_config::Layout {
++            gaps: 16.0,
++            center_focused_column: niri_config::CenterFocusedColumn::Always,
++            border: niri_config::Border {
++                off: true,
++                ..Default::default()
++            },
++            focus_depth: niri_config::FocusDepth {
++                off: false,
++                inactive_scale: 0.9,
++                inactive_opacity: 0.75,
++                inactive_blur: 2.0,
++                stack_overlap: 40.0,
++            },
++            ..Default::default()
++        },
++        ..Options::default()
++    };
++    options.animations.horizontal_view_movement.0.kind = LINEAR;
++
++    let mut layout = check_ops_with_options(
++        options,
++        [
++            Op::AddOutput(1),
++            Op::AddWindow {
++                params: TestWindowParams::new(1),
++            },
++            Op::AddWindow {
++                params: TestWindowParams::new(2),
++            },
++            Op::AddWindow {
++                params: TestWindowParams::new(3),
++            },
++            Op::SetForcedSize {
++                id: 1,
++                size: Some(Size::new(400, 400)),
++            },
++            Op::SetForcedSize {
++                id: 2,
++                size: Some(Size::new(400, 400)),
++            },
++            Op::SetForcedSize {
++                id: 3,
++                size: Some(Size::new(400, 400)),
++            },
++            Op::Communicate(1),
++            Op::Communicate(2),
++            Op::Communicate(3),
++            Op::CompleteAnimations,
++        ],
++    );
++
++    // Active column is col 2 (window 3). Render order should be nearest-first: 3, 2, 1.
++    {
++        let ws = layout.active_workspace().unwrap();
++        let render_ids: Vec<usize> = ws
++            .tiles_with_render_positions()
++            .map(|(tile, _, _)| *tile.window().id())
++            .collect();
++        assert_eq!(render_ids, vec![3, 2, 1]);
++
++        let tile_by_id = |id| {
++            ws.tiles_with_render_positions()
++                .find(|(t, _, _)| *t.window().id() == id)
++                .map(|(t, pos, _)| {
++                    (
++                        t.focus_depth_scale(),
++                        t.focus_depth_opacity(),
++                        t.focus_depth_blur_options(),
++                        pos,
++                    )
++                })
++                .unwrap()
++        };
++
++        let (s3, a3, b3, p3) = tile_by_id(3);
++        let (s2, a2, b2, p2) = tile_by_id(2);
++        let (s1, a1, b1, p1) = tile_by_id(1);
++
++        assert_abs_diff_eq!(s3, 1.0, epsilon = 1e-5);
++        assert_abs_diff_eq!(a3, 1.0, epsilon = 1e-5);
++        assert!(b3.is_none());
++        assert_abs_diff_eq!(p3.x, 440.0, epsilon = 1e-5);
++
++        assert_abs_diff_eq!(s2, 0.9, epsilon = 1e-5);
++        assert_abs_diff_eq!(a2, 0.75, epsilon = 1e-5);
++        assert_eq!(b2.map(|b| b.passes), Some(2));
++        // Logical x2 = 440 - (400 + 16) = 24; pull = (400*0 + 400*0.1)*0.5 + 40 = 60 -> 84.
++        assert_abs_diff_eq!(p2.x, 84.0, epsilon = 1e-5);
++
++        assert_abs_diff_eq!(s1, 0.9, epsilon = 1e-5);
++        assert_abs_diff_eq!(a1, 0.75, epsilon = 1e-5);
++        assert_eq!(b1.map(|b| b.passes), Some(2));
++        // Cumulative left pull: 60 (from active->2) + (400*0.1 + 400*0.1)*0.5 + 40 = 140.
++        // Logical x1 = 24 - 416 = -392; visual = -392 + 140 = -252.
++        assert_abs_diff_eq!(p1.x, -252.0, epsilon = 1e-5);
++    }
++
++    // Focus middle column (window 2). Transitions should start seamlessly without a jump.
++    Op::FocusColumnLeft.apply(&mut layout);
++    {
++        let ws = layout.active_workspace().unwrap();
++        let find_id = |id| {
++            ws.tiles_with_render_positions()
++                .find(|(t, _, _)| *t.window().id() == id)
++                .map(|(t, _, _)| (t.focus_depth_scale(), t.focus_depth_opacity()))
++                .unwrap()
++        };
++        assert_abs_diff_eq!(find_id(2).0, 0.9, epsilon = 1e-5);
++        assert_abs_diff_eq!(find_id(3).0, 1.0, epsilon = 1e-5);
++    }
++
++    // Halfway through linear 1000ms transition.
++    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
++    {
++        let ws = layout.active_workspace().unwrap();
++        let find_id = |id| {
++            ws.tiles_with_render_positions()
++                .find(|(t, _, _)| *t.window().id() == id)
++                .map(|(t, _, _)| {
++                    (
++                        t.focus_depth_scale(),
++                        t.focus_depth_opacity(),
++                        t.focus_depth_blur_options(),
++                    )
++                })
++                .unwrap()
++        };
++        let (s2, a2, b2) = find_id(2);
++        let (s3, a3, b3) = find_id(3);
++        assert_abs_diff_eq!(s2, 0.95, epsilon = 1e-4);
++        assert_abs_diff_eq!(a2, 0.875, epsilon = 1e-4);
++        assert_eq!(b2.map(|b| b.passes), Some(2));
++        assert_abs_diff_eq!(s3, 0.95, epsilon = 1e-4);
++        assert_abs_diff_eq!(a3, 0.875, epsilon = 1e-4);
++        assert_eq!(b3.map(|b| b.passes), Some(2));
++    }
++
++    // Complete animations and check symmetric stacking + inverse hit-testing on col 0 & col 2.
++    Op::AdvanceAnimations { msec_delta: 500 }.apply(&mut layout);
++    let (p1, p2, p3) = {
++        let ws = layout.active_workspace().unwrap();
++        let pos_of = |id| {
++            ws.tiles_with_render_positions()
++                .find(|(t, _, _)| *t.window().id() == id)
++                .map(|(_, pos, _)| pos)
++                .unwrap()
++        };
++        (pos_of(1), pos_of(2), pos_of(3))
++    };
++
++    assert_abs_diff_eq!(p2.x, 440.0, epsilon = 1e-5);
++    assert_abs_diff_eq!(p1.x, 84.0, epsilon = 1e-5);
++    assert_abs_diff_eq!(p3.x, 796.0, epsilon = 1e-5);
++
++    let output = layout.outputs().next().unwrap().clone();
++    // Window 1 is 400x400 centered at +200,+200, scaled to 0.9 => visual box spans [20..380] from p1.
++    // Top-left of unscaled box (p1 + (5, 5)) must NOT hit window 1.
++    assert!(layout
++        .window_under(&output, p1 + Point::from((5.0, 5.0)))
++        .is_none());
++    // Old untucked logical position (x = 24 + 5) must NOT hit window 1 either.
++    assert!(layout
++        .window_under(&output, Point::from((29.0, p1.y + 200.0)))
++        .is_none());
++    // Inside the scaled & tucked box (p1 + (30, 30)) MUST hit window 1.
++    let (hit_win, _) = layout
++        .window_under(&output, p1 + Point::from((30.0, 30.0)))
++        .unwrap();
++    assert_eq!(*hit_win.id(), 1);
++    // Inside window 3's scaled & tucked box (p3 + (370, 200)) MUST hit window 3.
++    let (hit_win, _) = layout
++        .window_under(&output, p3 + Point::from((370.0, 200.0)))
++        .unwrap();
++    assert_eq!(*hit_win.id(), 3);
++
++    // Setting inactive_blur = 0.0 disables content blur while keeping scale/opacity.
++    let mut no_blur_options = (*layout.options).clone();
++    no_blur_options.layout.focus_depth.inactive_blur = 0.0;
++    layout.update_options(no_blur_options);
++    let ws = layout.active_workspace().unwrap();
++    assert!(ws
++        .tiles_with_render_positions()
++        .all(|(t, _, _)| t.focus_depth_blur_options().is_none()));
++}
+diff --git a/src/layout/tile.rs b/src/layout/tile.rs
+index 86c7eba..5b9c5a4 100644
+--- a/src/layout/tile.rs
++++ b/src/layout/tile.rs
+@@ -1,12 +1,18 @@
+ use core::f64;
++use std::cell::RefCell;
+ use std::rc::Rc;
+ 
+ use niri_config::utils::MergeWith as _;
+ use niri_config::{Color, CornerRadius, GradientInterpolation};
+ use niri_ipc::WindowLayout;
+-use smithay::backend::renderer::element::{Element, Kind};
+-use smithay::backend::renderer::gles::GlesRenderer;
+-use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
++use smithay::backend::renderer::element::utils::{
++    Relocate, RelocateRenderElement, RescaleRenderElement,
++};
++use smithay::backend::renderer::element::{Element, Id, Kind};
++use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
++use smithay::backend::renderer::utils::CommitCounter;
++use smithay::backend::renderer::{Offscreen as _, Renderer as _, Texture as _};
++use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size};
+ 
+ use super::focus_ring::{FocusRing, FocusRingRenderElement};
+ use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
+@@ -19,12 +25,16 @@ use crate::animation::{Animation, Clock};
+ use crate::layout::SizingMode;
+ use crate::niri_render_elements;
+ use crate::render_helpers::background_effect::BackgroundEffectElement;
++use crate::render_helpers::blur::{Blur, BlurOptions};
+ use crate::render_helpers::border::BorderRenderElement;
+ use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
+ use crate::render_helpers::damage::ExtraDamage;
+-use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
++use crate::render_helpers::offscreen::{
++    FocusDepthOffscreenElement, OffscreenBuffer, OffscreenRenderElement,
++};
+ use crate::render_helpers::renderer::NiriRenderer;
+ use crate::render_helpers::resize::ResizeRenderElement;
++use crate::render_helpers::shaders::Shaders;
+ use crate::render_helpers::shadow::ShadowRenderElement;
+ use crate::render_helpers::snapshot::RenderSnapshot;
+ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+@@ -102,6 +112,9 @@ pub struct Tile<W: LayoutElement> {
+     /// Snapshot of the last render for use in the close animation.
+     unmap_snapshot: Option<TileRenderSnapshot>,
+ 
++    /// Focus-depth (unfocused scale/opacity) state.
++    focus_depth: FocusDepthState,
++
+     /// Extra damage for clipped surface corner radius changes.
+     rounded_corner_damage: RoundedCornerDamage,
+ 
+@@ -131,6 +144,7 @@ niri_render_elements! {
+         Shadow = ShadowRenderElement,
+         ClippedSurface = ClippedSurfaceRenderElement<R>,
+         Offscreen = OffscreenRenderElement,
++        FocusDepth = RelocateRenderElement<RescaleRenderElement<FocusDepthOffscreenElement>>,
+         ExtraDamage = ExtraDamage,
+         BackgroundEffect = BackgroundEffectElement,
+     }
+@@ -174,6 +188,135 @@ pub(super) struct AlphaAnimation {
+     offscreen: OffscreenBuffer,
+ }
+ 
++/// Cached Dual-Kawase blur for an unfocused tile's offscreen texture.
++#[derive(Debug)]
++struct FocusDepthBlurCache {
++    id: Id,
++    blur: Option<Blur>,
++    blurred: Option<GlesTexture>,
++    last_src_id: Option<Id>,
++    last_src_commit: CommitCounter,
++    last_src_size: Size<i32, Buffer>,
++    last_options: Option<BlurOptions>,
++    commit: CommitCounter,
++}
++
++impl Default for FocusDepthBlurCache {
++    fn default() -> Self {
++        Self {
++            id: Id::new(),
++            blur: None,
++            blurred: None,
++            last_src_id: None,
++            last_src_commit: CommitCounter::default(),
++            last_src_size: Size::default(),
++            last_options: None,
++            commit: CommitCounter::default(),
++        }
++    }
++}
++
++impl FocusDepthBlurCache {
++    fn render_blur(
++        &mut self,
++        renderer: &mut GlesRenderer,
++        src_elem: &OffscreenRenderElement,
++        options: BlurOptions,
++    ) -> Option<(GlesTexture, CommitCounter)> {
++        let src_tex = src_elem.texture();
++        let src_id = src_elem.id();
++        let src_commit = src_elem.current_commit();
++        let src_size = src_tex.size();
++
++        if let Some(tex) = &self.blurred {
++            if self.last_src_id.as_ref() == Some(src_id)
++                && self.last_src_commit == src_commit
++                && self.last_src_size == src_size
++                && self.last_options == Some(options)
++                && self
++                    .blur
++                    .as_ref()
++                    .is_some_and(|b| b.context_id() == renderer.context_id())
++            {
++                return Some((tex.clone(), self.commit));
++            }
++        }
++
++        // Release old reference before prepare_textures so Blur::textures[0].is_unique_reference() stays true.
++        self.blurred = None;
++
++        if self
++            .blur
++            .as_ref()
++            .is_some_and(|b| b.context_id() != renderer.context_id())
++        {
++            self.blur = None;
++        }
++
++        let blur = if let Some(blur) = &mut self.blur {
++            blur
++        } else {
++            let Some(blur) = Blur::new(renderer) else {
++                return None;
++            };
++            self.blur.insert(blur)
++        };
++
++        if let Err(err) = blur.prepare_textures(
++            |fourcc, size| renderer.create_buffer(fourcc, size),
++            src_tex,
++            options,
++        ) {
++            warn!("error preparing focus-depth window blur textures: {err:?}");
++            return None;
++        }
++
++        match blur.render(renderer, src_tex, options) {
++            Ok(blurred) => {
++                self.commit.increment();
++                self.blurred = Some(blurred.clone());
++                self.last_src_id = Some(src_id.clone());
++                self.last_src_commit = src_commit;
++                self.last_src_size = src_size;
++                self.last_options = Some(options);
++                Some((blurred, self.commit))
++            }
++            Err(err) => {
++                warn!("error rendering focus-depth window blur: {err:?}");
++                None
++            }
++        }
++    }
++}
++
++/// State of the focus-depth effect for a tile.
++///
++/// Progress goes from 0 (focused, normal) to 1 (unfocused, receded).
++#[derive(Debug, Default)]
++struct FocusDepthState {
++    initialized: bool,
++    target_inactive: bool,
++    anim: Option<Animation>,
++    overview_progress: f64,
++    offscreen: OffscreenBuffer,
++    blur_cache: RefCell<FocusDepthBlurCache>,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct RenderInnerOpts {
++    include_background_effect: bool,
++    skip_corner_clip: bool,
++}
++
++impl Default for RenderInnerOpts {
++    fn default() -> Self {
++        Self {
++            include_background_effect: true,
++            skip_corner_clip: false,
++        }
++    }
++}
++
+ impl<W: LayoutElement> Tile<W> {
+     pub fn new(
+         window: W,
+@@ -207,6 +350,7 @@ impl<W: LayoutElement> Tile<W> {
+             alpha_animation: None,
+             interactive_move_offset: Point::from((0., 0.)),
+             unmap_snapshot: None,
++            focus_depth: FocusDepthState::default(),
+             rounded_corner_damage: Default::default(),
+             view_size,
+             scale,
+@@ -439,6 +583,12 @@ impl<W: LayoutElement> Tile<W> {
+                 self.alpha_animation = None;
+             }
+         }
++
++        if let Some(anim) = &self.focus_depth.anim {
++            if anim.is_done() {
++                self.focus_depth.anim = None;
++            }
++        }
+     }
+ 
+     pub fn are_animations_ongoing(&self) -> bool {
+@@ -454,6 +604,129 @@ impl<W: LayoutElement> Tile<W> {
+                 .alpha_animation
+                 .as_ref()
+                 .is_some_and(|alpha| !alpha.anim.is_done())
++            || self
++                .focus_depth
++                .anim
++                .as_ref()
++                .is_some_and(|anim| !anim.is_done())
++    }
++
++    /// Updates the focus-depth target for this tile.
++    ///
++    /// `overview_progress` relaxes the effect while the overview is open.
++    pub fn sync_focus_depth(&mut self, is_active: bool, overview_progress: f64) {
++        self.focus_depth.overview_progress = overview_progress.clamp(0., 1.);
++        let target_inactive = !is_active && !self.options.layout.focus_depth.off;
++
++        if !self.focus_depth.initialized {
++            self.focus_depth.initialized = true;
++            self.focus_depth.target_inactive = target_inactive;
++            self.focus_depth.anim = None;
++            return;
++        }
++
++        if self.focus_depth.target_inactive != target_inactive {
++            let current = self.focus_depth_raw_progress();
++            self.focus_depth.target_inactive = target_inactive;
++            let to = if target_inactive { 1. } else { 0. };
++            if (current - to).abs() <= 1e-4 {
++                self.focus_depth.anim = None;
++            } else {
++                self.focus_depth.anim = Some(Animation::new(
++                    self.clock.clone(),
++                    current,
++                    to,
++                    0.,
++                    self.options.animations.horizontal_view_movement.0,
++                ));
++            }
++        }
++    }
++
++    pub fn focus_depth_raw_progress(&self) -> f64 {
++        if let Some(anim) = &self.focus_depth.anim {
++            anim.value()
++        } else if self.focus_depth.target_inactive && !self.options.layout.focus_depth.off {
++            1.
++        } else {
++            0.
++        }
++    }
++
++    pub fn focus_depth_clamped_progress(&self) -> f64 {
++        if let Some(anim) = &self.focus_depth.anim {
++            anim.clamped_value().clamp(0., 1.)
++        } else if self.focus_depth.target_inactive && !self.options.layout.focus_depth.off {
++            1.
++        } else {
++            0.
++        }
++    }
++
++    fn focus_depth_factor(&self) -> f64 {
++        (1. - self.expanded_progress()) * (1. - self.focus_depth.overview_progress)
++    }
++
++    /// Visual scale applied to the tile by the focus-depth effect.
++    pub fn focus_depth_scale(&self) -> f64 {
++        if self.options.layout.focus_depth.off && self.focus_depth.anim.is_none() {
++            return 1.;
++        }
++        let t = self.focus_depth_raw_progress() * self.focus_depth_factor();
++        if t.abs() <= 1e-4 {
++            return 1.;
++        }
++        let target_s = self.options.layout.focus_depth.inactive_scale.clamp(0.5, 1.0);
++        (1. + (target_s - 1.) * t).clamp(0.2, 1.5)
++    }
++
++    /// Opacity multiplier applied to the tile by the focus-depth effect.
++    pub fn focus_depth_opacity(&self) -> f32 {
++        if self.options.layout.focus_depth.off && self.focus_depth.anim.is_none() {
++            return 1.;
++        }
++        let t = self.focus_depth_clamped_progress() * self.focus_depth_factor();
++        if t.abs() <= 1e-4 {
++            return 1.;
++        }
++        let target_a = self
++            .options
++            .layout
++            .focus_depth
++            .inactive_opacity
++            .clamp(0.05, 1.0);
++        (1. + (target_a - 1.) * t).clamp(0., 1.) as f32
++    }
++
++    /// Dual-Kawase blur parameters applied to unfocused tile contents, if active.
++    pub fn focus_depth_blur_options(&self) -> Option<BlurOptions> {
++        if self.options.layout.focus_depth.off && self.focus_depth.anim.is_none() {
++            return None;
++        }
++        let max_blur = self.options.layout.focus_depth.inactive_blur.clamp(0., 10.);
++        if max_blur <= 1e-4 {
++            return None;
++        }
++        let t = self.focus_depth_clamped_progress() * self.focus_depth_factor();
++        let strength = max_blur * t;
++        if strength < 0.15 {
++            None
++        } else if strength <= 0.9 {
++            Some(BlurOptions {
++                passes: 1,
++                offset: (strength - 0.15) * 1.4,
++            })
++        } else if strength <= 3.5 {
++            Some(BlurOptions {
++                passes: 2,
++                offset: (strength - 0.5) * 0.75,
++            })
++        } else {
++            Some(BlurOptions {
++                passes: 3,
++                offset: (strength - 2.0) * 0.55,
++            })
++        }
+     }
+ 
+     pub fn update_render_elements(&mut self, is_active: bool, view_rect: Rectangle<f64, Logical>) {
+@@ -690,7 +963,7 @@ impl<W: LayoutElement> Tile<W> {
+         }
+     }
+ 
+-    fn expanded_progress(&self) -> f64 {
++    pub(super) fn expanded_progress(&self) -> f64 {
+         if let Some(resize) = &self.resize_animation {
+             if let Some(anim) = &resize.expanded_progress {
+                 return anim.clamped_value().clamp(0., 1.);
+@@ -1027,8 +1300,9 @@ impl<W: LayoutElement> Tile<W> {
+         location: Point<f64, Logical>,
+         mut xray_pos: XrayPos,
+         focus_ring: bool,
++        opts: RenderInnerOpts,
+         push: &mut dyn FnMut(TileRenderElement<R>),
+-    ) {
++    ) -> bool {
+         let _span = tracy_client::span!("Tile::render_inner");
+ 
+         let scale = Scale::from(self.scale);
+@@ -1075,14 +1349,19 @@ impl<W: LayoutElement> Tile<W> {
+             .scaled_by(1. - expanded_progress as f32);
+ 
+         // Popups go on top, whether it's resize or not.
++        let mut has_popups = false;
+         self.window.render_popups(
+             ctx.r(),
+             window_render_loc,
+             scale,
+             win_alpha,
+             xray_pos,
+-            &mut |elem| push(elem.into()),
++            &mut |elem| {
++                has_popups = true;
++                push(elem.into());
++            },
+         );
++        let clip_surface_to_geometry = clip_to_geometry && !(opts.skip_corner_clip && !has_popups);
+ 
+         // If we're resizing, try to render a shader, or a fallback.
+         let mut pushed_resize = false;
+@@ -1173,7 +1452,7 @@ impl<W: LayoutElement> Tile<W> {
+             let clip = |elem| match elem {
+                 LayoutElementRenderElement::Wayland(elem) => {
+                     // If we should clip to geometry, render a clipped window.
+-                    if clip_to_geometry {
++                    if clip_surface_to_geometry {
+                         if let Some(shader) = clip_shader.clone() {
+                             if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
+                                 return ClippedSurfaceRenderElement::new(
+@@ -1227,7 +1506,7 @@ impl<W: LayoutElement> Tile<W> {
+                 }
+             };
+ 
+-            if clip_to_geometry && clip_shader.is_some() {
++            if clip_surface_to_geometry && clip_shader.is_some() {
+                 let damage = self.rounded_corner_damage.render(geo);
+                 push(damage.into());
+             }
+@@ -1301,16 +1580,60 @@ impl<W: LayoutElement> Tile<W> {
+                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+         }
+ 
+-        let surface_anim_scale = animated_window_size / window_size;
++        if opts.include_background_effect {
++            let surface_anim_scale = animated_window_size / window_size;
++            self.window.render_background_effect(
++                ctx.as_gles(),
++                area,
++                self.scale,
++                clip_to_geometry,
++                surface_anim_scale,
++                radius,
++                xray_pos,
++                &mut |elem| push(elem.into()),
++            );
++        }
++
++        has_popups
++    }
++
++    fn render_background_effect_scaled(
++        &self,
++        mut ctx: RenderCtx<GlesRenderer>,
++        location: Point<f64, Logical>,
++        xray_pos: XrayPos,
++        depth_scale: f64,
++        push: &mut dyn FnMut(BackgroundEffectElement),
++    ) {
++        let fullscreen_progress = self.fullscreen_progress();
++        let expanded_progress = self.expanded_progress();
++        let rules = self.window.rules();
++        let clip_to_geometry = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
++
++        let geo_size = self.animated_tile_size();
++        let center = geo_size.to_point().downscale(2.);
++        let offset_from_tile =
++            center.upscale(1. - depth_scale) + (self.bob_offset() + self.window_loc()).upscale(depth_scale);
++        let scaled_size = self.animated_window_size().upscale(depth_scale);
++        let scaled_area = Rectangle::new(location + offset_from_tile, scaled_size);
++
++        let window_size = self.window_size();
++        let surface_anim_scale = scaled_size / window_size;
++        let radius = self
++            .window
++            .geometry_corner_radius()
++            .scaled_by((1. - expanded_progress as f32) * depth_scale as f32);
++        let scaled_xray_pos = xray_pos.offset(offset_from_tile);
++
+         self.window.render_background_effect(
+-            ctx.as_gles(),
+-            area,
++            ctx.r(),
++            scaled_area,
+             self.scale,
+             clip_to_geometry,
+             surface_anim_scale,
+             radius,
+-            xray_pos,
+-            &mut |elem| push(elem.into()),
++            scaled_xray_pos,
++            push,
+         );
+     }
+ 
+@@ -1331,6 +1654,17 @@ impl<W: LayoutElement> Tile<W> {
+             .as_ref()
+             .map_or(1., |alpha| alpha.anim.clamped_value()) as f32;
+ 
++        let depth_scale = self.focus_depth_scale();
++        let depth_alpha = self.focus_depth_opacity();
++        let depth_blur = self.focus_depth_blur_options();
++        let has_focus_depth = (depth_scale - 1.).abs() > 1e-4
++            || (depth_alpha - 1.).abs() > 1e-4
++            || depth_blur.is_some();
++
++        if !has_focus_depth {
++            self.focus_depth.blur_cache.borrow_mut().blurred = None;
++        }
++
+         let mut pushed = false;
+         self.window().set_offscreen_data(None);
+ 
+@@ -1342,6 +1676,7 @@ impl<W: LayoutElement> Tile<W> {
+                 Point::new(0., 0.),
+                 xray_pos,
+                 focus_ring,
++                RenderInnerOpts::default(),
+                 &mut |elem| elements.push(elem),
+             );
+             match open.render(
+@@ -1350,7 +1685,7 @@ impl<W: LayoutElement> Tile<W> {
+                 self.animated_tile_size(),
+                 location,
+                 scale,
+-                tile_alpha,
++                tile_alpha * depth_alpha,
+             ) {
+                 Ok((elem, data)) => {
+                     self.window().set_offscreen_data(Some(data));
+@@ -1361,6 +1696,128 @@ impl<W: LayoutElement> Tile<W> {
+                     warn!("error rendering window opening animation: {err:?}");
+                 }
+             }
++        } else if has_focus_depth {
++            let mut ctx = ctx.as_gles();
++            let geo_size = self.animated_tile_size();
++            let center = geo_size.to_point().downscale(2.);
++
++            let rules = self.window.rules();
++            let expanded_progress = self.expanded_progress();
++            let fullscreen_progress = self.fullscreen_progress();
++            let clip_to_geometry = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
++            let radius = self
++                .window
++                .geometry_corner_radius()
++                .scaled_by(1. - expanded_progress as f32);
++            let window_size = self.window_size();
++            let fitted_radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
++            let can_post_clip = depth_blur.is_some()
++                && clip_to_geometry
++                && fitted_radius != CornerRadius::default()
++                && self.visual_border_width().is_none()
++                && self.shadow.is_off()
++                && self.resize_animation.is_none();
++
++            let mut elements = Vec::new();
++            let has_popups = self.render_inner(
++                ctx.r(),
++                Point::new(0., 0.),
++                xray_pos,
++                focus_ring,
++                RenderInnerOpts {
++                    include_background_effect: false,
++                    skip_corner_clip: can_post_clip,
++                },
++                &mut |elem| elements.push(elem),
++            );
++            match self
++                .focus_depth
++                .offscreen
++                .render_exact(ctx.renderer, scale, &elements)
++            {
++                Ok((elem, _sync, mut data)) => {
++                    let src_buf_size = elem.texture().size();
++                    let offset = elem.offset();
++
++                    let (texture, commit, elem_id) = if let Some(blur_opts) = depth_blur {
++                        let mut blur_cache = self.focus_depth.blur_cache.borrow_mut();
++                        if let Some((blurred, commit)) =
++                            blur_cache.render_blur(ctx.renderer, &elem, blur_opts)
++                        {
++                            (blurred, commit, blur_cache.id.clone())
++                        } else {
++                            (
++                                elem.texture().clone(),
++                                elem.current_commit(),
++                                elem.id().clone(),
++                            )
++                        }
++                    } else {
++                        self.focus_depth.blur_cache.borrow_mut().blurred = None;
++                        (
++                            elem.texture().clone(),
++                            elem.current_commit(),
++                            elem.id().clone(),
++                        )
++                    };
++
++                    let do_post_clip = can_post_clip && !has_popups;
++                    let clip = do_post_clip.then(|| {
++                        let window_geo = Rectangle::new(
++                            self.bob_offset() + self.window_loc(),
++                            self.animated_window_size(),
++                        );
++                        (window_geo, fitted_radius, (self.scale * depth_scale) as f32)
++                    });
++                    let clip_program = if do_post_clip {
++                        Shaders::get(ctx.renderer).clipped_surface.clone()
++                    } else {
++                        None
++                    };
++
++                    let fd_elem = FocusDepthOffscreenElement::new(
++                        elem_id.clone(),
++                        texture,
++                        ctx.renderer.context_id(),
++                        scale,
++                        commit,
++                        offset,
++                        src_buf_size,
++                        tile_alpha * depth_alpha,
++                        clip,
++                        clip_program,
++                    );
++                    let elem = RescaleRenderElement::from_element(
++                        fd_elem,
++                        center.to_physical_precise_round(scale),
++                        depth_scale,
++                    );
++                    let elem = RelocateRenderElement::from_element(
++                        elem,
++                        location.to_physical_precise_round(scale),
++                        Relocate::Relative,
++                    );
++
++                    data.id = elem_id;
++                    self.window().set_offscreen_data(Some(data));
++                    push(elem.into());
++
++                    // Draw backdrop blur directly on the main pass behind the scaled window.
++                    if tile_alpha > 0.5 {
++                        self.render_background_effect_scaled(
++                            ctx.r(),
++                            location,
++                            xray_pos,
++                            depth_scale,
++                            &mut |elem| push(elem.into()),
++                        );
++                    }
++                    pushed = true;
++                }
++                Err(err) => {
++                    warn!("error rendering tile to offscreen for focus depth: {err:?}");
++                }
++            }
+         } else if let Some(alpha) = &self.alpha_animation {
+             let mut ctx = ctx.as_gles();
+             let mut elements = Vec::new();
+@@ -1369,6 +1826,7 @@ impl<W: LayoutElement> Tile<W> {
+                 Point::new(0., 0.),
+                 xray_pos,
+                 focus_ring,
++                RenderInnerOpts::default(),
+                 &mut |elem| elements.push(elem),
+             );
+             match alpha.offscreen.render(ctx.renderer, scale, &elements) {
+@@ -1387,7 +1845,14 @@ impl<W: LayoutElement> Tile<W> {
+         }
+ 
+         if !pushed {
+-            self.render_inner(ctx, location, xray_pos, focus_ring, &mut |elem| push(elem));
++            self.render_inner(
++                ctx,
++                location,
++                xray_pos,
++                focus_ring,
++                RenderInnerOpts::default(),
++                &mut |elem| push(elem),
++            );
+         }
+     }
+ 
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 49548a8..5a1c3d7 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -375,6 +375,10 @@ impl<W: LayoutElement> Workspace<W> {
+         self.scrolling.are_transitions_ongoing() || self.floating.are_transitions_ongoing()
+     }
+ 
++    pub fn set_overview_progress(&mut self, overview_progress: f64) {
++        self.scrolling.set_overview_progress(overview_progress);
++    }
++
+     pub fn update_render_elements(&mut self, is_active: bool) {
+         self.scrolling
+             .update_render_elements(is_active && !self.floating_is_active.get());
+@@ -1778,6 +1782,13 @@ impl<W: LayoutElement> Workspace<W> {
+                 }
+ 
+                 let pos_within_tile = pos - tile_pos;
++                let depth_scale = tile.focus_depth_scale();
++                let pos_within_tile = if (depth_scale - 1.).abs() > 1e-4 {
++                    let center = tile.animated_tile_size().to_point().downscale(2.);
++                    (pos_within_tile - center).downscale(depth_scale) + center
++                } else {
++                    pos_within_tile
++                };
+ 
+                 if tile.hit(pos_within_tile).is_some() {
+                     let size = tile.tile_size().to_f64();
+diff --git a/src/render_helpers/offscreen.rs b/src/render_helpers/offscreen.rs
+index 2f624b1..1ab73e1 100644
+--- a/src/render_helpers/offscreen.rs
++++ b/src/render_helpers/offscreen.rs
+@@ -1,13 +1,17 @@
+ use std::cell::RefCell;
+ 
+ use anyhow::Context as _;
++use glam::{Mat3, Vec2};
++use niri_config::CornerRadius;
+ use smithay::backend::allocator::Fourcc;
+ use smithay::backend::renderer::damage::OutputDamageTracker;
+ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+ use smithay::backend::renderer::element::{
+     Element, Id, Kind, RenderElement, RenderElementStates, UnderlyingStorage,
+ };
+-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
++use smithay::backend::renderer::gles::{
++    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
++};
+ use smithay::backend::renderer::sync::SyncPoint;
+ use smithay::backend::renderer::utils::{
+     CommitCounter, DamageBag, DamageSet, DamageSnapshot, OpaqueRegions,
+@@ -20,6 +24,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
+ 
+ use super::encompassing_geo;
+ use super::renderer::AsGlesFrame as _;
++use super::shaders::mat3_uniform;
+ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+ 
+ /// Buffer for offscreen rendering.
+@@ -74,6 +79,25 @@ impl OffscreenBuffer {
+         renderer: &mut GlesRenderer,
+         scale: Scale<f64>,
+         elements: &[impl RenderElement<GlesRenderer>],
++    ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
++        self.render_with_options(renderer, scale, elements, false)
++    }
++
++    pub fn render_exact(
++        &self,
++        renderer: &mut GlesRenderer,
++        scale: Scale<f64>,
++        elements: &[impl RenderElement<GlesRenderer>],
++    ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
++        self.render_with_options(renderer, scale, elements, true)
++    }
++
++    fn render_with_options(
++        &self,
++        renderer: &mut GlesRenderer,
++        scale: Scale<f64>,
++        elements: &[impl RenderElement<GlesRenderer>],
++        exact_size: bool,
+     ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
+         let _span = tracy_client::span!("OffscreenBuffer::render");
+ 
+@@ -103,9 +127,14 @@ impl OffscreenBuffer {
+         }) = inner.as_mut()
+         {
+             let old_size = texture.size();
+-            if old_size.w < src_size.w || old_size.h < src_size.h {
++            let size_mismatch = if exact_size {
++                old_size != src_size
++            } else {
++                old_size.w < src_size.w || old_size.h < src_size.h
++            };
++            if size_mismatch {
+                 size_string = format!(
+-                    "size increased from {} × {} to {} × {}",
++                    "size changed from {} × {} to {} × {}",
+                     old_size.w, old_size.h, src_size.w, src_size.h
+                 );
+                 reason = &size_string;
+@@ -366,3 +395,189 @@ impl<'render> RenderElement<TtyRenderer<'render>> for OffscreenRenderElement {
+         None
+     }
+ }
++
++/// Offscreen render element with optional post-blur rounded-corner clipping for focus-depth.
++#[derive(Debug, Clone)]
++pub struct FocusDepthOffscreenElement {
++    id: Id,
++    texture: GlesTexture,
++    renderer_context_id: ContextId<GlesTexture>,
++    scale: Scale<f64>,
++    commit: CommitCounter,
++    offset: Point<f64, Logical>,
++    src_size: Size<i32, Buffer>,
++    alpha: f32,
++    clip: Option<(Rectangle<f64, Logical>, CornerRadius, f32)>,
++    clip_program: Option<GlesTexProgram>,
++}
++
++impl FocusDepthOffscreenElement {
++    #[allow(clippy::too_many_arguments)]
++    pub fn new(
++        id: Id,
++        texture: GlesTexture,
++        renderer_context_id: ContextId<GlesTexture>,
++        scale: Scale<f64>,
++        commit: CommitCounter,
++        offset: Point<f64, Logical>,
++        src_size: Size<i32, Buffer>,
++        alpha: f32,
++        clip: Option<(Rectangle<f64, Logical>, CornerRadius, f32)>,
++        clip_program: Option<GlesTexProgram>,
++    ) -> Self {
++        Self {
++            id,
++            texture,
++            renderer_context_id,
++            scale,
++            commit,
++            offset,
++            src_size,
++            alpha,
++            clip,
++            clip_program,
++        }
++    }
++
++    pub fn logical_size(&self) -> Size<f64, Logical> {
++        self.src_size
++            .to_f64()
++            .to_logical(self.scale, Transform::Normal)
++    }
++}
++
++impl Element for FocusDepthOffscreenElement {
++    fn id(&self) -> &Id {
++        &self.id
++    }
++
++    fn current_commit(&self) -> CommitCounter {
++        self.commit
++    }
++
++    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
++        let logical_geo = Rectangle::new(self.offset, self.logical_size());
++        logical_geo.to_physical_precise_round(scale)
++    }
++
++    fn transform(&self) -> Transform {
++        Transform::Normal
++    }
++
++    fn src(&self) -> Rectangle<f64, Buffer> {
++        Rectangle::from_size(self.src_size).to_f64()
++    }
++
++    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
++        OpaqueRegions::default()
++    }
++
++    fn alpha(&self) -> f32 {
++        self.alpha
++    }
++
++    fn kind(&self) -> Kind {
++        Kind::Unspecified
++    }
++}
++
++impl RenderElement<GlesRenderer> for FocusDepthOffscreenElement {
++    fn draw(
++        &self,
++        frame: &mut GlesFrame<'_, '_>,
++        src: Rectangle<f64, Buffer>,
++        dest: Rectangle<i32, Physical>,
++        damage: &[Rectangle<i32, Physical>],
++        opaque_regions: &[Rectangle<i32, Physical>],
++        _cache: Option<&UserDataMap>,
++    ) -> Result<(), GlesError> {
++        if frame.context_id() != self.renderer_context_id {
++            warn!("trying to render texture from different renderer");
++            return Ok(());
++        }
++
++        if let (Some((clip_geo, corner_radius, effective_scale)), Some(program)) =
++            (self.clip, &self.clip_program)
++        {
++            let buf_size_logical = self
++                .texture
++                .size()
++                .to_f64()
++                .to_logical(self.scale, Transform::Normal);
++            let buf_v = Vec2::new(buf_size_logical.w as f32, buf_size_logical.h as f32);
++            let geo_v = Vec2::new(clip_geo.size.w as f32, clip_geo.size.h as f32);
++            let off_v = Vec2::new(
++                (self.offset.x - clip_geo.loc.x) as f32,
++                (self.offset.y - clip_geo.loc.y) as f32,
++            );
++            let input_to_geo =
++                Mat3::from_scale(buf_v / geo_v) * Mat3::from_translation(off_v / buf_v);
++
++            let uniforms = [
++                Uniform::new("niri_scale", effective_scale),
++                Uniform::new("geo_size", [geo_v.x, geo_v.y]),
++                Uniform::new("corner_radius", <[f32; 4]>::from(corner_radius)),
++                mat3_uniform("input_to_geo", input_to_geo),
++            ];
++
++            frame.render_texture_from_to(
++                &self.texture,
++                src,
++                dest,
++                damage,
++                opaque_regions,
++                Transform::Normal,
++                self.alpha,
++                Some(program),
++                &uniforms,
++            )
++        } else {
++            frame.render_texture_from_to(
++                &self.texture,
++                src,
++                dest,
++                damage,
++                opaque_regions,
++                Transform::Normal,
++                self.alpha,
++                None,
++                &[],
++            )
++        }
++    }
++
++    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
++        None
++    }
++}
++
++impl<'render> RenderElement<TtyRenderer<'render>> for FocusDepthOffscreenElement {
++    fn draw(
++        &self,
++        frame: &mut TtyFrame<'_, '_, '_>,
++        src: Rectangle<f64, Buffer>,
++        dst: Rectangle<i32, Physical>,
++        damage: &[Rectangle<i32, Physical>],
++        opaque_regions: &[Rectangle<i32, Physical>],
++        cache: Option<&UserDataMap>,
++    ) -> Result<(), TtyRendererError<'render>> {
++        let gles_frame = frame.as_gles_frame();
++        RenderElement::<GlesRenderer>::draw(
++            &self,
++            gles_frame,
++            src,
++            dst,
++            damage,
++            opaque_regions,
++            cache,
++        )?;
++        Ok(())
++    }
++
++    fn underlying_storage(
++        &self,
++        _renderer: &mut TtyRenderer<'render>,
++    ) -> Option<UnderlyingStorage<'_>> {
++        None
++    }
++}

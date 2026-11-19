@@ -1,0 +1,30 @@
+// Niri Focus-Depth Configuration (聚焦景深与紧密堆叠动效)
+//
+// Add one line at the bottom of ~/.config/niri/config.kdl:
+//   If installed via repository script:
+//     include "/path/to/niri-focus-depth/focus-depth.kdl"
+//   If installed via Arch PKGBUILD:
+//     include "/usr/share/doc/niri-focus-depth/focus-depth.kdl"
+
+layout {
+    focus-depth {
+        on
+        // 未聚焦窗口缩放比例 (0.5 ~ 1.0)，纯 GPU 视觉缩放，不触发客户端重排
+        inactive-scale 0.92
+        // 未聚焦窗口额外透明度乘数（叠加在 window-rule opacity 之上，例如 0.8 * 0.82 ≈ 0.656）
+        inactive-opacity 0.82
+        // 未聚焦窗口内容本身的景深模糊强度 (0 ~ 10，0 为关闭；推荐 1.5 ~ 3.0)
+        inactive-blur 2.0
+        // 未聚焦列向聚焦列内侧收拢堆叠的像素偏移（消除缩放空白并产生 2.5D 卡片层叠感）
+        stack-overlap 48
+    }
+}
+
+// 示例：如需为某个显示器或工作区单独关闭 / 微调参数：
+// output "HDMI-A-1" {
+//     layout {
+//         focus-depth {
+//             off
+//         }
+//     }
+// }
